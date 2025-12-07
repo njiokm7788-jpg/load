@@ -34,6 +34,7 @@ type ProxyServer struct {
 	channelFactory    *channel.Factory
 	requestLogService *services.RequestLogService
 	encryptionSvc     encryption.Service
+	protocolAdapter   *ProtocolAdapter
 }
 
 // NewProxyServer creates a new proxy server
@@ -54,6 +55,7 @@ func NewProxyServer(
 		channelFactory:    channelFactory,
 		requestLogService: requestLogService,
 		encryptionSvc:     encryptionSvc,
+		protocolAdapter:   NewProtocolAdapter(),
 	}, nil
 }
 
@@ -88,6 +90,12 @@ func (ps *ProxyServer) HandleProxy(c *gin.Context) {
 		}
 	}
 
+	originalChannel, err := ps.channelFactory.GetChannel(originalGroup)
+	if err != nil {
+		response.Error(c, app_errors.NewAPIError(app_errors.ErrInternalServer, fmt.Sprintf("Failed to get channel for group '%s': %v", groupName, err)))
+		return
+	}
+
 	channelHandler, err := ps.channelFactory.GetChannel(group)
 	if err != nil {
 		response.Error(c, app_errors.NewAPIError(app_errors.ErrInternalServer, fmt.Sprintf("Failed to get channel for group '%s': %v", groupName, err)))
@@ -102,13 +110,27 @@ func (ps *ProxyServer) HandleProxy(c *gin.Context) {
 	}
 	c.Request.Body.Close()
 
+	isStream := originalChannel.IsStreamRequest(c, bodyBytes)
+
+	if originalGroup.ChannelType != group.ChannelType {
+		newPath, adaptedBody, err := ps.protocolAdapter.AdaptRequest(originalGroup.ChannelType, group.ChannelType, c.Request.URL.Path, bodyBytes)
+		if err != nil {
+			response.Error(c, app_errors.NewAPIError(app_errors.ErrBadRequest, err.Error()))
+			return
+		}
+
+		if newPath != "" {
+			c.Request.URL.Path = newPath
+		}
+		bodyBytes = adaptedBody
+		c.Request.Header.Set("Content-Type", "application/json")
+	}
+
 	finalBodyBytes, err := ps.applyParamOverrides(bodyBytes, group)
 	if err != nil {
 		response.Error(c, app_errors.NewAPIError(app_errors.ErrInternalServer, fmt.Sprintf("Failed to apply parameter overrides: %v", err)))
 		return
 	}
-
-	isStream := channelHandler.IsStreamRequest(c, bodyBytes)
 
 	ps.executeRequestWithRetry(c, channelHandler, originalGroup, group, finalBodyBytes, isStream, startTime, 0)
 }
@@ -125,6 +147,7 @@ func (ps *ProxyServer) executeRequestWithRetry(
 	retryCount int,
 ) {
 	cfg := group.EffectiveConfig
+	crossChannel := originalGroup.ChannelType != group.ChannelType
 
 	apiKey, err := ps.keyProvider.SelectKey(group.ID)
 	if err != nil {
@@ -265,6 +288,59 @@ func (ps *ProxyServer) executeRequestWithRetry(
 	// Check if this is a model list request (needs special handling)
 	if shouldInterceptModelList(c.Request.URL.Path, c.Request.Method) {
 		ps.handleModelListResponse(c, resp, group, channelHandler)
+	} else if crossChannel {
+		if isStream {
+			for key, values := range resp.Header {
+				for _, value := range values {
+					c.Header(key, value)
+				}
+			}
+			c.Header("Content-Type", "text/event-stream")
+			c.Header("Cache-Control", "no-cache")
+			c.Header("Connection", "keep-alive")
+			c.Header("X-Accel-Buffering", "no")
+
+			c.Status(resp.StatusCode)
+
+			flusher, ok := c.Writer.(http.Flusher)
+			if !ok {
+				logrus.Error("Streaming unsupported by the writer, falling back to normal response")
+				ps.handleNormalResponse(c, resp)
+				return
+			}
+
+			if err := ps.protocolAdapter.AdaptStream(originalGroup.ChannelType, group.ChannelType, resp.Body, c.Writer, flusher); err != nil {
+				response.Error(c, app_errors.NewAPIError(app_errors.ErrInternalServer, err.Error()))
+				return
+			}
+		} else {
+			respBody, err := io.ReadAll(resp.Body)
+			if err != nil {
+				logrus.Errorf("Failed to read upstream response for adaptation: %v", err)
+				response.Error(c, app_errors.NewAPIError(app_errors.ErrInternalServer, "Failed to read upstream response"))
+				return
+			}
+
+			adaptedBody, contentType, err := ps.protocolAdapter.AdaptResponse(originalGroup.ChannelType, group.ChannelType, respBody)
+			if err != nil {
+				response.Error(c, app_errors.NewAPIError(app_errors.ErrInternalServer, err.Error()))
+				return
+			}
+
+			for key, values := range resp.Header {
+				for _, value := range values {
+					c.Header(key, value)
+				}
+			}
+			if contentType != "" {
+				c.Header("Content-Type", contentType)
+			}
+
+			c.Status(resp.StatusCode)
+			if _, err := c.Writer.Write(adaptedBody); err != nil {
+				logUpstreamError("writing adapted response", err)
+			}
+		}
 	} else {
 		for key, values := range resp.Header {
 			for _, value := range values {
